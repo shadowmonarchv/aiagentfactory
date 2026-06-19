@@ -1,194 +1,101 @@
 import os
-import sys
-import subprocess
-import re
-from typing import List
-
-# ==========================================
-# 0. AUTO-INSTALLER
-# ==========================================
-try:
-    import groq
-except ImportError:
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "groq", "-q"])
-
-try:
-    from duckduckgo_search import DDGS
-except ImportError:
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "duckduckgo-search", "-q"])
-
-from pydantic import BaseModel, Field
-from pydantic_ai import Agent
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
-import uvicorn
-import os
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from groq import Groq
 from dotenv import load_dotenv
 
-# ==========================================
-# 1. CREDENTIALS
-# ==========================================
+# Load environment variables from .env file
 load_dotenv()
 
-YOUR_API_KEY = os.getenv("GROQ_API_KEY")
-
-app = FastAPI(title="Meta-Agent Factory", version="1.0")
-
-
-# ==========================================
-# 2. SCHEMA & TOOLS
-# ==========================================
-class AgentBlueprint(BaseModel):
-    agent_name: str = Field(description="A distinct, single-word name for the Agent.")
-    description: str = Field(description="A short summary of what the agent does.")
-    system_prompt: str = Field(description="Detailed instructions written in the second person.")
-    required_tools: List[str] = Field(description="List of required tools chosen ONLY from the available registry.")
-
-
-def web_search(query: str) -> str:
-    """Searches the live internet for up-to-date information."""
-    try:
-        results = DDGS().text(query, max_results=3)
-        if not results:
-            return "No web results found."
-
-        compiled_results = "\n\n".join([f"Source: {res['title']}\nSnippet: {res['body']}" for res in results])
-        return f"[LIVE WEB RESULTS FOR '{query}']:\n{compiled_results}"
-    except Exception as e:
-        return f"Web search failed: {str(e)}"
-
-
-def document_writer(content: str, filename: str) -> str:
-    return f"[MOCK FILE SYSTEM] Successfully saved document to '{filename}.md'."
-
-
-TOOL_REGISTRY = {
-    "web_search": web_search,
-    "document_writer": document_writer
-}
-
-# ==========================================
-# 3. AGENT DEFINITIONS & MEMORY
-# ==========================================
-compiler_agent = Agent(
-    "groq:llama-3.1-8b-instant",
-    output_type=AgentBlueprint,
-    system_prompt="""
-    Analyze the user's request. 
-    Extract the user's requirements and output a structured AgentBlueprint. 
-    You must instruct the generated agent to act like a 20-year veteran in its field. It must speak with absolute authority, use professional jargon correctly, and synthesize information clearly without sounding like a robotic AI.
-    Select applicable tools from this list ONLY: [web_search, document_writer]. If the agent needs to answer questions, ALWAYS give it the web_search tool.
-    """
+# Initialize FastAPI Application
+app = FastAPI(
+    title="META Agent Factory - AI Core Engine",
+    description="Microservice handling direct LLM generation and orchestration via Groq.",
+    version="1.0.0"
 )
 
+# Configure CORS Middleware to allow cross-origin communication from frontends/backends
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-class DynamicAgentRunner:
-    def __init__(self, blueprint: AgentBlueprint):
-        self.blueprint = blueprint
+# Initialize the Groq SDK Client
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+client = None
 
-        # --- NEW: INITIALIZE THE MEMORY BANK ---
-        self.chat_history = []
-
-        veteran_prompt = (
-                self.blueprint.system_prompt +
-                "\n\nCRITICAL DIRECTIVE: You are a veteran expert. If asked a question, use the web_search tool "
-                "to gather facts, then synthesize those facts into a masterclass explanation. "
-                "DO NOT under any circumstances output raw XML tags, bracketed tool names, text-based search queries, "
-                "or characters like '<' and '>' to show your thought process. Only output your final, beautifully "
-                "formatted paragraph responses."
-        )
-
-        self.agent = Agent(
-            "groq:llama-3.1-8b-instant",
-            system_prompt=veteran_prompt
-        )
-        for tool_name in self.blueprint.required_tools:
-            if tool_name in TOOL_REGISTRY:
-                self.agent.tool_plain(TOOL_REGISTRY[tool_name])
-
-    def run(self, prompt: str) -> str:
-        # --- NEW: PASS HISTORY IN AND SAVE UPDATED HISTORY OUT ---
-        result = self.agent.run_sync(prompt, message_history=self.chat_history)
-
-        if hasattr(result, 'all_messages'):
-            self.chat_history = result.all_messages()
-
-        # Safely extract text depending on the pydantic-ai version
-        return getattr(result, 'data', getattr(result, 'output', str(result)))
+if GROQ_API_KEY:
+    try:
+        client = Groq(api_key=GROQ_API_KEY)
+        print("[ENGINE] Groq Client successfully initialized.")
+    except Exception as e:
+        print(print(f"[ERROR] Failed to initialize Groq Client: {e}"))
+else:
+    print("[WARNING] GROQ_API_KEY missing from environment configuration. Chat endpoints will remain offline.")
 
 
-class MockRunner:
-    def __init__(self, agent_name: str):
-        self.agent_name = agent_name
-        self.chat_history = []
-
-    def run(self, prompt: str) -> str:
-        return f"[LOCAL SIMULATION] Directive received: '{prompt}'. (Invalid API key or network block)."
-
-
-# ==========================================
-# 4. FASTAPI ROUTES
-# ==========================================
-DEPLOYED_AGENTS = {}
-
-
-class CompileRequest(BaseModel):
-    transcript: str
-
-
+# Data Validation Schema matching the frontend payload
 class ChatRequest(BaseModel):
     agent_name: str
     message: str
 
 
-@app.post("/api/v1/factory/compile")
-def compile_agent(request: CompileRequest):
-    try:
-        result = compiler_agent.run_sync(request.transcript)
-
-        # Safely extract blueprint depending on the pydantic-ai version
-        blueprint = getattr(result, 'data', getattr(result, 'output', None))
-
-        runner = DynamicAgentRunner(blueprint)
-        DEPLOYED_AGENTS[blueprint.agent_name] = runner
-        return {"status": "success", "blueprint": blueprint.model_dump()}
-    except Exception as e:
-        print(f"\n[WARNING] API connection failed: {str(e)}")
-        fallback_blueprint = AgentBlueprint(
-            agent_name="Sim_Agent_01",
-            description="Operating in Local Simulation Mode.",
-            system_prompt="You are a simulated offline agent.",
-            required_tools=["document_writer"]
-        )
-        DEPLOYED_AGENTS[fallback_blueprint.agent_name] = MockRunner(fallback_blueprint.agent_name)
-        return {"status": "success", "blueprint": fallback_blueprint.model_dump()}
-
-
-@app.post("/api/v1/agent/chat")
-def chat_with_agent(request: ChatRequest):
-    if request.agent_name not in DEPLOYED_AGENTS:
-        raise HTTPException(status_code=404, detail="Agent not found in memory.")
-    try:
-        runner = DEPLOYED_AGENTS[request.agent_name]
-        response_text = runner.run(request.message)
-
-        # ANTI-LEAK SANITIZATION LAYER
-        sanitized_text = re.sub(r'<[^>]+>.*?</[^>]+>', '', response_text, flags=re.DOTALL)
-        sanitized_text = re.sub(r'<[^>]+>', '', sanitized_text)
-
-        return {"response": sanitized_text.strip()}
-
-    except Exception as e:
-        return {"response": f"[LOCAL OVERRIDE] Agent encountered an upstream error: {str(e)}"}
-
-
-# ==========================================
-# 5. SERVE FRONTEND
-# ==========================================
 @app.get("/")
-def serve_ui():
-    return FileResponse("index.html")
+def health_check():
+    """
+    Basic service health check verification endpoint.
+    """
+    return {
+        "status": "online",
+        "service": "META Agent Factory Engine",
+        "llm_provider": "Groq (Llama-3.1-8b-instant)"
+    }
+
+
+@app.post("/v1/agent/chat")
+def chat_with_agent(req: ChatRequest):
+    """
+    Core execution endpoint. Accepts an agent identity and a prompt message,
+    then evaluates the response directly against the LLM architecture.
+    """
+    if not client:
+        return {
+            "response": "[SYSTEM OFFLINE] Python execution context cannot detect a valid GROQ_API_KEY in the environment."
+        }
+
+    try:
+        # Execute context injection directly to the target inference model
+        completion = client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=[
+                {
+                    "role": "system",
+                    "content": f"You are {req.agent_name}, an expert specialized AI assistant. Provide highly accurate, clean, structured, and direct technical answers fit for an elite agent workflow."
+                },
+                {
+                    "role": "user",
+                    "content": req.message
+                }
+            ],
+            temperature=0.6,
+            max_tokens=1024
+        )
+
+        # Return cleanly parsed inference text back to the platform layer
+        return {"response": completion.choices[0].message.content}
+
+    except Exception as e:
+        return {
+            "response": f"[CRITICAL EXCEPTION] Downstream Groq API Handshake Error: {str(e)}"
+        }
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8081)
+    import uvicorn
+
+    # Automatically boots up the Uvicorn ASGI server when running the file directly
+    uvicorn.run("app:app", host="127.0.0.1", port=8000, reload=True)
