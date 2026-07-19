@@ -1,101 +1,78 @@
-import os
+import re
+import logging
+import base64  # 🛠️ NEW: Built-in library to safely handle image math
+from typing import Optional, List, Dict, Any
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from groq import Groq
-from dotenv import load_dotenv
+import ollama
 
-# Load environment variables from .env file
-load_dotenv()
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - [AI STREAM] - %(message)s")
 
-# Initialize FastAPI Application
-app = FastAPI(
-    title="META Agent Factory - AI Core Engine",
-    description="Microservice handling direct LLM generation and orchestration via Groq.",
-    version="1.0.0"
-)
-
-# Configure CORS Middleware to allow cross-origin communication from frontends/backends
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# Initialize the Groq SDK Client
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-client = None
-
-if GROQ_API_KEY:
-    try:
-        client = Groq(api_key=GROQ_API_KEY)
-        print("[ENGINE] Groq Client successfully initialized.")
-    except Exception as e:
-        print(print(f"[ERROR] Failed to initialize Groq Client: {e}"))
-else:
-    print("[WARNING] GROQ_API_KEY missing from environment configuration. Chat endpoints will remain offline.")
+app = FastAPI(title="METAfactory Core Engine")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"],
+                   allow_headers=["*"])
 
 
-# Data Validation Schema matching the frontend payload
 class ChatRequest(BaseModel):
     agent_name: str
     message: str
-
-
-@app.get("/")
-def health_check():
-    """
-    Basic service health check verification endpoint.
-    """
-    return {
-        "status": "online",
-        "service": "META Agent Factory Engine",
-        "llm_provider": "Groq (Llama-3.1-8b-instant)"
-    }
+    image_base64: Optional[str] = None
+    history: List[Dict[str, Any]] = []
 
 
 @app.post("/v1/agent/chat")
 def chat_with_agent(req: ChatRequest):
-    """
-    Core execution endpoint. Accepts an agent identity and a prompt message,
-    then evaluates the response directly against the LLM architecture.
-    """
-    if not client:
-        return {
-            "response": "[SYSTEM OFFLINE] Python execution context cannot detect a valid GROQ_API_KEY in the environment."
-        }
-
     try:
-        # Execute context injection directly to the target inference model
-        completion = client.chat.completions.create(
-            model="llama-3.1-8b-instant",
-            messages=[
-                {
-                    "role": "system",
-                    "content": f"You are {req.agent_name}, an expert specialized AI assistant. Provide highly accurate, clean, structured, and direct technical answers fit for an elite agent workflow."
-                },
-                {
-                    "role": "user",
-                    "content": req.message
-                }
-            ],
-            temperature=0.6,
-            max_tokens=1024
+        system_instruction = (
+            f"You are {req.agent_name}, an elite expert AI. "
+            "Provide clear, concise, and highly structured answers using Markdown. "
+            "Keep responses brief and direct unless explicitly asked for deep detail."
         )
+        flow = [{"role": "system", "content": system_instruction}]
 
-        # Return cleanly parsed inference text back to the platform layer
-        return {"response": completion.choices[0].message.content}
+        for msg in req.history:
+            flow.append({"role": msg.get("role", "user"), "content": msg.get("content", "")})
+
+        user_msg = {"role": "user", "content": req.message if req.message else "Analyze the provided visual data."}
+
+        # Default to the ultra-fast text model
+        target_model = 'llama3.2:1b'
+
+        if req.image_base64:
+            logging.info(f"Visual payload detected. Switching engine to 'moondream'...")
+            target_model = 'moondream'
+
+            # 🛠️ THE FIX: Safely parse, pad, and decode the image
+            b64_data = re.sub(r'^data:image/.+;base64,', '', req.image_base64)
+
+            # 1. Add missing mathematical padding (browsers often strip this)
+            b64_data += "=" * ((4 - len(b64_data) % 4) % 4)
+
+            # 2. Decode to raw bytes so Ollama never mistakes it for a broken file path
+            image_bytes = base64.b64decode(b64_data)
+
+            user_msg["images"] = [image_bytes]
+        else:
+            logging.info(f"Text-only payload. Using fast engine '{target_model}' for agent: {req.agent_name}")
+
+        flow.append(user_msg)
+
+        def token_generator():
+            response_stream = ollama.chat(model=target_model, messages=flow, stream=True)
+            for chunk in response_stream:
+                text_chunk = chunk['message']['content']
+                yield text_chunk
+
+        return StreamingResponse(token_generator(), media_type="text/plain")
 
     except Exception as e:
-        return {
-            "response": f"[CRITICAL EXCEPTION] Downstream Groq API Handshake Error: {str(e)}"
-        }
+        logging.error(f"Streaming Exception: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 if __name__ == "__main__":
     import uvicorn
 
-    # Automatically boots up the Uvicorn ASGI server when running the file directly
-    uvicorn.run("app:app", host="127.0.0.1", port=8000, reload=True)
+    uvicorn.run("app:app", host="127.0.0.1", port=8000, timeout_keep_alive=300)
